@@ -50,6 +50,19 @@ typedef struct {
     runtime_mode_t mode;
 } ctx_t;
 
+typedef struct {
+    char *path;
+    char *algo;
+    char *digest;
+    mode_t mode;
+} digest_entry_t;
+
+typedef struct {
+    char *path;
+    char *target;
+    mode_t mode;
+} symlink_entry_t;
+
 static int ensure_dir(const char *path, mode_t mode) {
     struct stat st;
     if (stat(path, &st) == 0) {
@@ -257,6 +270,192 @@ static bool is_executable_mode(mode_t m) {
     return S_ISREG(m) && (m & 0111);
 }
 
+static bool is_symlink_mode(mode_t m) {
+    return S_ISLNK(m);
+}
+
+static char *xstrdup_safe(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s) + 1;
+    char *out = (char *)malloc(n);
+    if (!out) return NULL;
+    memcpy(out, s, n);
+    return out;
+}
+
+static int append_digest_entry(digest_entry_t **arr, size_t *count, size_t *cap,
+                               const char *path, mode_t mode, const char *algo, const char *digest) {
+    if (*count == *cap) {
+        size_t ncap = (*cap == 0) ? 16 : (*cap * 2);
+        void *p = realloc(*arr, ncap * sizeof((*arr)[0]));
+        if (!p) return -1;
+        *arr = (digest_entry_t *)p;
+        *cap = ncap;
+    }
+    (*arr)[*count].path = xstrdup_safe(path);
+    (*arr)[*count].algo = xstrdup_safe(algo ? algo : "unknown");
+    (*arr)[*count].digest = xstrdup_safe(digest ? digest : "");
+    (*arr)[*count].mode = mode;
+    if (!(*arr)[*count].path || !(*arr)[*count].algo || !(*arr)[*count].digest) return -1;
+    (*count)++;
+    return 0;
+}
+
+static int append_symlink_entry(symlink_entry_t **arr, size_t *count, size_t *cap,
+                                const char *path, mode_t mode, const char *target) {
+    if (*count == *cap) {
+        size_t ncap = (*cap == 0) ? 16 : (*cap * 2);
+        void *p = realloc(*arr, ncap * sizeof((*arr)[0]));
+        if (!p) return -1;
+        *arr = (symlink_entry_t *)p;
+        *cap = ncap;
+    }
+    (*arr)[*count].path = xstrdup_safe(path);
+    (*arr)[*count].target = xstrdup_safe(target ? target : "");
+    (*arr)[*count].mode = mode;
+    if (!(*arr)[*count].path || !(*arr)[*count].target) return -1;
+    (*count)++;
+    return 0;
+}
+
+static void free_digest_entries(digest_entry_t *arr, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(arr[i].path);
+        free(arr[i].algo);
+        free(arr[i].digest);
+    }
+    free(arr);
+}
+
+static void free_symlink_entries(symlink_entry_t *arr, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        free(arr[i].path);
+        free(arr[i].target);
+    }
+    free(arr);
+}
+
+static const digest_entry_t *find_digest_entry(const digest_entry_t *arr, size_t count, const char *path) {
+    if (!path) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        if (arr[i].path && strcmp(arr[i].path, path) == 0) {
+            return &arr[i];
+        }
+    }
+    return NULL;
+}
+
+static const symlink_entry_t *find_symlink_entry(const symlink_entry_t *arr, size_t count, const char *path) {
+    if (!path) return NULL;
+    for (size_t i = 0; i < count; i++) {
+        if (arr[i].path && strcmp(arr[i].path, path) == 0) {
+            return &arr[i];
+        }
+    }
+    return NULL;
+}
+
+static char *normalize_abs_path(const char *path) {
+    if (!path || path[0] != '/') return NULL;
+    char *tmp = xstrdup_safe(path);
+    if (!tmp) return NULL;
+
+    char *segments[256];
+    int top = 0;
+    char *save = NULL;
+    char *tok = strtok_r(tmp, "/", &save);
+    while (tok) {
+        if (strcmp(tok, ".") == 0 || strcmp(tok, "") == 0) {
+            /* skip */
+        } else if (strcmp(tok, "..") == 0) {
+            if (top > 0) top--;
+        } else if (top < (int)(sizeof(segments) / sizeof(segments[0]))) {
+            segments[top++] = tok;
+        }
+        tok = strtok_r(NULL, "/", &save);
+    }
+
+    size_t need = 2;
+    for (int i = 0; i < top; i++) need += strlen(segments[i]) + 1;
+    char *out = (char *)malloc(need);
+    if (!out) {
+        free(tmp);
+        return NULL;
+    }
+    size_t pos = 0;
+    out[pos++] = '/';
+    for (int i = 0; i < top; i++) {
+        size_t l = strlen(segments[i]);
+        memcpy(out + pos, segments[i], l);
+        pos += l;
+        if (i != top - 1) out[pos++] = '/';
+    }
+    out[pos] = '\0';
+    free(tmp);
+    return out;
+}
+
+static char *dirname_of(const char *path) {
+    if (!path) return xstrdup_safe("/");
+    const char *last = strrchr(path, '/');
+    if (!last || last == path) return xstrdup_safe("/");
+    size_t len = (size_t)(last - path);
+    char *out = (char *)malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return out;
+}
+
+static char *resolve_link_target_path(const char *link_path, const char *target) {
+    if (!target || target[0] == '\0') return NULL;
+    if (target[0] == '/') {
+        return normalize_abs_path(target);
+    }
+
+    char *dir = dirname_of(link_path);
+    if (!dir) return NULL;
+    size_t n = strlen(dir) + 1 + strlen(target) + 1;
+    char *combined = (char *)malloc(n);
+    if (!combined) {
+        free(dir);
+        return NULL;
+    }
+    snprintf(combined, n, "%s/%s", dir, target);
+    free(dir);
+
+    char *norm = normalize_abs_path(combined);
+    free(combined);
+    return norm;
+}
+
+static const digest_entry_t *resolve_symlink_to_digest(const symlink_entry_t *sym_arr,
+                                                       size_t sym_count,
+                                                       const digest_entry_t *dig_arr,
+                                                       size_t dig_count,
+                                                       const symlink_entry_t *start,
+                                                       char **resolved_real_path) {
+    const symlink_entry_t *cur = start;
+    char *candidate = NULL;
+
+    for (int depth = 0; depth < 8 && cur; depth++) {
+        free(candidate);
+        candidate = resolve_link_target_path(cur->path, cur->target);
+        if (!candidate) break;
+
+        const digest_entry_t *dig = find_digest_entry(dig_arr, dig_count, candidate);
+        if (dig) {
+            *resolved_real_path = candidate;
+            return dig;
+        }
+
+        cur = find_symlink_entry(sym_arr, sym_count, candidate);
+    }
+
+    free(candidate);
+    return NULL;
+}
+
 static int buffer_digest_record(const char *txid,
                                 const char *nevra,
                                 const char *rpm_path,
@@ -286,18 +485,20 @@ static int send_collect_event(const char *txid,
                               const char *nevra,
                               const char *rpm_path,
                               const char *file_path,
+                              const char *real_path,
                               mode_t fmode,
                               const char *algo,
                               const char *digest) {
     char json[4096];
     snprintf(json, sizeof(json),
-             "{\"type\":\"EXEC_DIGEST_COLLECT\",\"mode\":\"%s\",\"decision\":\"%s\",\"txid\":\"%s\",\"nevra\":\"%s\",\"rpm_path\":\"%s\",\"file_path\":\"%s\",\"file_mode\":%u,\"digest_algo\":\"%s\",\"digest\":\"%s\"}",
+             "{\"type\":\"EXEC_DIGEST_COLLECT\",\"mode\":\"%s\",\"decision\":\"%s\",\"txid\":\"%s\",\"nevra\":\"%s\",\"rpm_path\":\"%s\",\"file_path\":\"%s\",\"real_path\":\"%s\",\"file_mode\":%u,\"digest_algo\":\"%s\",\"digest\":\"%s\"}",
              mode,
              decision,
              txid ? txid : "-",
              nevra ? nevra : "-",
              rpm_path ? rpm_path : "-",
              file_path ? file_path : "-",
+             real_path ? real_path : file_path ? file_path : "-",
              (unsigned)fmode,
              algo ? algo : "unknown",
              digest ? digest : "");
@@ -340,26 +541,70 @@ static int collect_exec_digests(rpmte te, ctx_t *ctx, const char *decision) {
     const char *nevra = rpmteNEVRA(te);
     const char *pkgpath = rpmteN(te);
 
+    digest_entry_t *digests = NULL;
+    size_t digest_count = 0, digest_cap = 0;
+    symlink_entry_t *symlinks = NULL;
+    size_t symlink_count = 0, symlink_cap = 0;
+
     while (rpmfiNext(fi) >= 0) {
         const char *path = rpmfiFN(fi);
         mode_t mode = rpmfiFMode(fi);
         const char *digest = rpmfiFDigestHex(fi, NULL);
+        const char *link_target = rpmfiFLink(fi);
         const char *algo = "unknown";
 
-        if (!is_executable_mode(mode)) {
+        if (is_executable_mode(mode)) {
+            (void)append_digest_entry(&digests, &digest_count, &digest_cap, path, mode, algo, digest);
+        } else if (is_symlink_mode(mode) && link_target && link_target[0] != '\0') {
+            (void)append_symlink_entry(&symlinks, &symlink_count, &symlink_cap, path, mode, link_target);
+        }
+    }
+
+    for (size_t i = 0; i < digest_count; i++) {
+        if (ctx->mode == MODE_ON) {
+            if (send_collect_event(ctx->txid, "ON", decision, nevra, pkgpath,
+                                   digests[i].path, digests[i].path, digests[i].mode,
+                                   digests[i].algo, digests[i].digest) != 0) {
+                /* send failure must not block rpm transaction */
+                (void)buffer_digest_record(ctx->txid, nevra, pkgpath,
+                                           digests[i].path, digests[i].mode,
+                                           digests[i].algo, digests[i].digest, decision);
+            }
+        } else {
+            (void)buffer_digest_record(ctx->txid, nevra, pkgpath,
+                                       digests[i].path, digests[i].mode,
+                                       digests[i].algo, digests[i].digest, "OBSERVE");
+        }
+    }
+
+    for (size_t i = 0; i < symlink_count; i++) {
+        char *real_path = NULL;
+        const digest_entry_t *real = resolve_symlink_to_digest(symlinks, symlink_count,
+                                                                digests, digest_count,
+                                                                &symlinks[i], &real_path);
+        if (!real || !real_path) {
+            free(real_path);
             continue;
         }
 
         if (ctx->mode == MODE_ON) {
-            if (send_collect_event(ctx->txid, "ON", decision, nevra, pkgpath, path, mode, algo, digest) != 0) {
-                /* send failure must not block rpm transaction */
-                (void)buffer_digest_record(ctx->txid, nevra, pkgpath, path, mode, algo, digest, decision);
+            if (send_collect_event(ctx->txid, "ON", decision, nevra, pkgpath,
+                                   symlinks[i].path, real_path, symlinks[i].mode,
+                                   real->algo, real->digest) != 0) {
+                (void)buffer_digest_record(ctx->txid, nevra, pkgpath,
+                                           symlinks[i].path, symlinks[i].mode,
+                                           real->algo, real->digest, decision);
             }
         } else {
-            (void)buffer_digest_record(ctx->txid, nevra, pkgpath, path, mode, algo, digest, "OBSERVE");
+            (void)buffer_digest_record(ctx->txid, nevra, pkgpath,
+                                       symlinks[i].path, symlinks[i].mode,
+                                       real->algo, real->digest, "OBSERVE");
         }
+        free(real_path);
     }
 
+    free_digest_entries(digests, digest_count);
+    free_symlink_entries(symlinks, symlink_count);
     rpmfiFree(fi);
     headerFree(h);
     enforce_cache_size_limit();
